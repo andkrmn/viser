@@ -1,12 +1,13 @@
 import random
 import time
+from PIL import Image
 from pathlib import Path
 from typing import List
-
+import open3d as o3d
+import glob
 from helpers import *
 import re, os
 import trimesh
-
 import imageio.v3 as iio
 import numpy as np
 import tyro
@@ -23,6 +24,7 @@ from viser.extras.colmap import (
 def main(
     colmap_path: Path = Path(__file__).parent / "assets/colmap_garden/sparse/0",
     images_path: Path = Path(__file__).parent / "rgb",
+    depth_path: Path = Path(__file__).parent / "depth",
     downsample_factor: int = 2,
 ) -> None:
     """Visualize COLMAP sparse reconstruction outputs.
@@ -44,6 +46,93 @@ def main(
         "Reset up direction",
         hint="Set the camera control 'up' direction to the current camera's 'up'.",
     )
+    # create dictionaries
+    object_pose_camera = parse_pose_data("newresults")
+    camera_pose_world = parse_poses('images.txt')
+    world_pose_data = compute_world_poses(object_pose_camera, camera_pose_world)
+    merged_world_poses = merge_object_variants(world_pose_data)
+    final_obj_poses_world = fill_missing_poses(merged_world_poses)
+
+    # initialize some things
+    handles = {}
+    rgb_paths = sorted(glob.glob(os.path.join(images_path, "frame_*.png")))
+    K = np.array([607.7611083984375, 0.0, 432.25628662109375,
+        0.0, 606.5545043945312, 237.27389526367188,
+        0.0, 0.0, 1.0]).reshape(3,3)
+    P = np.eye(4) # C2W
+    min_img = 1 # don't set to 0 or it will break - rip 1h :(
+    max_img = 25
+    visibility = False
+
+    for rgb_img_path in rgb_paths:
+        # get filename to get corresponding depth image and frame number
+        filename = os.path.basename(rgb_img_path)
+        depth_file = os.path.join(depth_path, filename)
+        image_idx = int(re.search(r'\d+', filename).group()) 
+        # only load a short sequence due to memory issues
+        if min_img <= image_idx <= max_img:
+            # get P from dict
+            # Extract quaternion and translation for frame 
+            quaternion = camera_pose_world[image_idx][0]  # [w, x, y, z]
+            translation = np.array(camera_pose_world[image_idx][1])  # (t_x, t_y, t_z)
+            # Convert quaternion to a 3x3 rotation matrix and calculate the transform
+            rotation_matrix = Rotation.from_quat(quaternion).as_matrix()
+            P = np.eye(4) # C2W
+            P[:3, :3] = rotation_matrix.T  # Transpose to get C2W
+            P[:3, 3] = translation  # Set translation
+            T_world_camera = tf.SE3.from_matrix(P).inverse()
+            # load the rgb image
+            rgb_pil = Image.open(rgb_img_path)
+            rgb_np = np.array(rgb_pil)
+            rgb_image = o3d.geometry.Image(rgb_np)
+            # load the depth image
+            depth_pil = Image.open(depth_file)
+            depth_np = np.array(depth_pil, dtype=np.uint16)  # Ensure it's 16-bit depth
+            depth_image = o3d.geometry.Image(depth_np)
+            rgbd_image = o3d.geometry.RGBDImage.create_from_color_and_depth(rgb_image, depth_image, convert_rgb_to_intensity=False)
+            # define K #TODO dimension 848x480?
+            width, height = rgb_pil.size
+            intrinsics = o3d.camera.PinholeCameraIntrinsic(
+                        width,
+                        height,
+                        K[0,0], 
+                        K[1,1],
+                        K[0,2],
+                        K[1,2])
+            pcd_o3d = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd_image, intrinsics)
+            pcd_points = np.array(pcd_o3d.points)  # @ c2w[:3,:3].T + c2w[:3,3]
+            pcd_colors = (np.array(pcd_o3d.colors)*255.0).astype(np.uint8)
+            image = np.array(rgb_image, dtype=np.uint8)  # not sure if necessary
+            frame_handle = server.scene.add_frame(
+                            f"/frame_{image_idx}",
+                            wxyz=T_world_camera.rotation().wxyz,
+                            position=T_world_camera.translation(),
+                            axes_length=0.005,
+                            axes_radius=0.001,
+                            visible=visibility
+                        )
+            frustum = server.scene.add_camera_frustum(
+                            f"/frame_{image_idx}/frustum",
+                            fov=60,
+                            aspect=width / height,
+                            scale=0.1,
+                            color=(255,0,0),
+                            # wxyz=tf.SO3.from_z_radians(-np.pi/2).wxyz,
+                            image=image,
+                            visible=visibility
+                        )
+            pcd_handle = server.scene.add_point_cloud(f"/frame_{image_idx}/pcd",
+                                    points=pcd_points,
+                                    colors=pcd_colors,
+                                    point_size=0.001,
+                                    visible=visibility
+                                    )
+            handles[image_idx] = {
+                'pcd': pcd_handle,
+                'frustum': frustum,
+                'frame': frame_handle
+            } 
+            print(f"added frame {image_idx}")
 
     @gui_reset_up.on_click
     def _(event: viser.GuiEvent) -> None:
@@ -147,8 +236,8 @@ def main(
                 scale=0.15,
                 image=image,
             )
-            attach_callback(frustum, frame)
-
+            attach_callback(frustum, frame)  
+            
     need_update = True
 
     @gui_points.on_update
@@ -166,22 +255,40 @@ def main(
     def _(_) -> None:
         point_cloud.point_size = gui_point_size.value
 
+    with server.gui.add_folder("Playback"):
+        gui_timestep = server.gui.add_slider(
+                "Timestep",
+                min=min_img,
+                max= max_img, 
+                step=1,
+                initial_value=1,
+                disabled=False,
+            )            
+        prev_timestep = gui_timestep.value
+        @gui_timestep.on_update
+        # TODO some frames are skipped when using the slider and i dont know why
+        def _(_) -> None:
+            nonlocal prev_timestep
+            current_timestep = gui_timestep.value
+            with server.atomic():
+                for v in handles[prev_timestep].values():
+                    v.visible = False
+                for v in handles[current_timestep].values():
+                    v.visible = True 
+            prev_timestep = current_timestep
+            server.flush()  # Optional! This will force the GUI to update immediately.
+
     while True:
         if need_update:
             need_update = False
             visualize_frames()
             server.scene.add_frame(
-                name = "name",
+                name = "world_coordinate_system :)",
                 wxyz=np.array([1,0,0,0]),
                 position=np.array([0,0,0]),
                 axes_length=0.1,
                 axes_radius=0.005,
             )
-            object_pose_camera = parse_pose_data("newresults")
-            camera_pose_world = parse_poses('images.txt')
-            world_pose_data = compute_world_poses(object_pose_camera, camera_pose_world)
-            merged_world_poses = merge_object_variants(world_pose_data)
-            final_obj_poses_world = fill_missing_poses(merged_world_poses)
 
             for obj, poses in final_obj_poses_world.items():
                 mesh = trimesh.load_mesh(os.path.join(f"resources/{obj}/mesh", f"{obj}.obj"), process=False)

@@ -286,16 +286,16 @@ world_pose_data = compute_world_poses(object_pose_camera, camera_pose_world)
 merged_world_poses = merge_object_variants(world_pose_data)
 final_obj_poses_world = fill_missing_poses(merged_world_poses)
 
-# Guide for final dict
-# this returns bowl poses of all frames (plus one additional frame pose at position 0)
-print(final_obj_poses_world["bowl"])
-# this returns bowl pose for frame 500
-print(final_obj_poses_world["bowl"][500])
-# this retruns the quaternions of bowl at frame 500 (for translation: final_obj_poses_world["bowl"][500][1])
-print(final_obj_poses_world["bowl"][500][0])
-# this retruns all keys (objects) of the dict
-for key, value in final_obj_poses_world.items():
-    print(key)
+# # Guide for final dict
+# # this returns bowl poses of all frames (plus one additional frame pose at position 0)
+# print(final_obj_poses_world["bowl"])
+# # this returns bowl pose for frame 500
+# print(final_obj_poses_world["bowl"][500])
+# # this retruns the quaternions of bowl at frame 500 (for translation: final_obj_poses_world["bowl"][500][1])
+# print(final_obj_poses_world["bowl"][500][0])
+# # this retruns all keys (objects) of the dict
+# for key, value in final_obj_poses_world.items():
+#     print(key)
 
 
 
