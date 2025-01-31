@@ -56,9 +56,9 @@ def parse_poses(file_path):
 
     Args:
         file_path (str): Path to the image.txt file containing the pose data.
-
     Returns:
-        dict: A dictionary where keys are frame numbers (integers) and values the quaternions and translation as lists
+        dict: A dictionary where keys are frame numbers (integers) 
+        and values the quaternions and translation of the camera in world coordinate frame as lists {frame_number: [[quaternionswxyz],[translation]]}
     """
     poses = {}
     with open(file_path, 'r') as f:
@@ -158,7 +158,6 @@ def compute_world_poses(object_pose_in_cam, camera_pose_in_world):
 
                 # Convert to wxyz format and store
                 #TODO maybe [frame-1] as there is no frame 0 and we start with frame 1 but irrelevant currently as it only adds one additional at the start
-                #TODO before visualizing depth should fix this, maybe use dict instead of list
                 obj_world[frame] = (
                     [world_quat[3], world_quat[0], world_quat[1], world_quat[2]],
                     world_trans
@@ -248,6 +247,7 @@ def fill_missing_poses(merged_world_poses):
     - Leading Nones (before first detection) get first valid pose
     - Subsequent Nones carry forward last valid pose
     Modifies the input dictionary in place
+    Returns: Final dictionary {obj_name:[(quat_wxyz, translation)] }
     """
     for obj_name, frame_poses in merged_world_poses.items():
         # Find first valid pose
@@ -285,7 +285,17 @@ camera_pose_world = parse_poses('images.txt')
 world_pose_data = compute_world_poses(object_pose_camera, camera_pose_world)
 merged_world_poses = merge_object_variants(world_pose_data)
 final_obj_poses_world = fill_missing_poses(merged_world_poses)
-print(final_obj_poses_world["bowl"][0][0])
+
+# Guide for final dict
+# this returns bowl poses of all frames (plus one additional frame pose at position 0)
+print(final_obj_poses_world["bowl"])
+# this returns bowl pose for frame 500
+print(final_obj_poses_world["bowl"][500])
+# this retruns the quaternions of bowl at frame 500 (for translation: final_obj_poses_world["bowl"][500][1])
+print(final_obj_poses_world["bowl"][500][0])
+# this retruns all keys (objects) of the dict
+for key, value in final_obj_poses_world.items():
+    print(key)
 
 
 
