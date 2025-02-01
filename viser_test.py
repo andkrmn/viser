@@ -12,6 +12,7 @@ import imageio.v3 as iio
 import numpy as np
 import tyro
 from tqdm.auto import tqdm
+from scipy.linalg import inv
 
 import viser
 import viser.transforms as tf
@@ -52,7 +53,8 @@ def main(
     world_pose_data = compute_world_poses(object_pose_camera, camera_pose_world)
     merged_world_poses = merge_object_variants(world_pose_data)
     final_obj_poses_world = fill_missing_poses(merged_world_poses)
-
+    with open("outputy.txt", "w") as f:
+        f.write(str(final_obj_poses_world))  # Convert dict to string and write
     # initialize some things
     handles = {}
     rgb_paths = sorted(glob.glob(os.path.join(images_path, "frame_*.png")))
@@ -73,12 +75,12 @@ def main(
         if min_img <= image_idx <= max_img:
             # get P from dict
             # Extract quaternion and translation for frame 
-            quaternion = camera_pose_world[image_idx][0]  # [w, x, y, z]
+            quaternion = np.array(camera_pose_world[image_idx][0])  # [w, x, y, z]
             translation = np.array(camera_pose_world[image_idx][1])  # (t_x, t_y, t_z)
             # Convert quaternion to a 3x3 rotation matrix and calculate the transform
-            rotation_matrix = Rotation.from_quat(quaternion).as_matrix()
+            rotation_matrix = Rotation.from_quat(quaternion, scalar_first=True).as_matrix()
             P = np.eye(4) # C2W
-            P[:3, :3] = rotation_matrix.T  # Transpose to get C2W
+            P[:3, :3] = rotation_matrix # Transpose to get C2W
             P[:3, 3] = translation  # Set translation
             T_world_camera = tf.SE3.from_matrix(P).inverse()
             # load the rgb image
@@ -133,6 +135,14 @@ def main(
                 'frame': frame_handle
             } 
             print(f"added frame {image_idx}")
+
+    server.scene.add_frame(
+    name = "world_coordinate_system",
+    wxyz=np.array([1,0,0,0]),
+    position=np.array([0,0,0]),
+    axes_length=0.1,
+    axes_radius=0.005,
+    )
 
     @gui_reset_up.on_click
     def _(event: viser.GuiEvent) -> None:
@@ -207,11 +217,12 @@ def main(
             image_filename = images_path / img.name
             if not image_filename.exists():
                 continue
-
+            print(img.tvec)
+            print(tf.SO3(img.qvec))
             T_world_camera = tf.SE3.from_rotation_and_translation(
                 tf.SO3(img.qvec), img.tvec
             ).inverse()
-
+            print(T_world_camera)
             frame = server.scene.add_frame(
                 f"/colmap/frame_{img_id}",
                 wxyz=T_world_camera.rotation().wxyz,
@@ -237,7 +248,30 @@ def main(
                 image=image,
             )
             attach_callback(frustum, frame)  
-            
+
+    def transform_to_frame(final_obj_poses_world, camera_in_world, img_id):
+        obj_at_frame = {}
+        for obj, poses in final_obj_poses_world.items():
+            print(obj)
+            # Pose amtrix of obj in world
+            quat =  poses[img_id][0]
+            trans = poses[img_id][1]
+            rot = Rotation.from_quat(quat, scalar_first=True).as_matrix()
+            P = np.eye(4) # C2W
+            P[:3, :3] = rot # Transpose to get C2W
+            P[:3, 3] = trans  # Set translation
+            P = inv(P)
+            # Pose matrix of camera in world
+            cam_quat_wxyz, cam_trans = camera_in_world[img_id]
+            rot_cam = Rotation.from_quat(cam_quat_wxyz, scalar_first=True).as_matrix()
+            T_cam_world = np.eye(4)
+            T_cam_world[:3, :3] = rot_cam
+            T_cam_world[:3, 3] = cam_trans
+            # Perform Transformation
+            T_cam_obj = P @ T_cam_world
+            T_obj_cam = inv(T_cam_obj)
+            obj_at_frame[obj] = T_obj_cam
+        return obj_at_frame     
     need_update = True
 
     @gui_points.on_update
@@ -270,6 +304,24 @@ def main(
         def _(_) -> None:
             nonlocal prev_timestep
             current_timestep = gui_timestep.value
+            obj_at_frame = transform_to_frame(final_obj_poses_world, camera_pose_world, current_timestep)
+            for obj, pose in obj_at_frame.items():
+                print(pose)
+                mesh = trimesh.load_mesh(os.path.join(f"resources/{obj}/mesh", f"{obj}.obj"), process=False)
+                vertices = mesh.vertices
+                faces = mesh.faces
+                rot_mat = pose[:3,:3]
+                quarternion = Rotation.from_matrix(rot_mat).as_quat(scalar_first=True)
+                translation = pose[:3,3]
+                server.scene.add_mesh_simple(
+                            name=f"/world_coordinate_system/{obj}_{current_timestep}",
+                            vertices=vertices,
+                            faces=faces,
+                            wxyz=quarternion,
+                            position=translation,
+                        )
+                print("added")
+
             with server.atomic():
                 for v in handles[prev_timestep].values():
                     v.visible = False
@@ -282,35 +334,29 @@ def main(
         if need_update:
             need_update = False
             visualize_frames()
-            server.scene.add_frame(
-                name = "world_coordinate_system :)",
-                wxyz=np.array([1,0,0,0]),
-                position=np.array([0,0,0]),
-                axes_length=0.1,
-                axes_radius=0.005,
-            )
 
-            for obj, poses in final_obj_poses_world.items():
-                mesh = trimesh.load_mesh(os.path.join(f"resources/{obj}/mesh", f"{obj}.obj"), process=False)
-                assert isinstance(mesh, trimesh.Trimesh)
-                vertices = mesh.vertices
-                faces = mesh.faces
-                # if obj == "milk":
-                #     break
-                for idx, pose in enumerate(poses):
-                    if idx == 1:
-                        print(f"added {obj} to frame {idx}")
-                        translation = pose[1]
-                        translation = np.array(translation)
-                        quarternion = pose[0]
-                        quarternion = np.array(quarternion)
-                        server.scene.add_mesh_simple(
-                            name=f"/name/{obj}_{idx}",
-                            vertices=vertices,
-                            faces=faces,
-                            wxyz=quarternion,
-                            position=translation,
-                        )
+
+            # for obj, poses in final_obj_poses_world.items():
+            #     mesh = trimesh.load_mesh(os.path.join(f"resources/{obj}/mesh", f"{obj}.obj"), process=False)
+            #     assert isinstance(mesh, trimesh.Trimesh)
+            #     vertices = mesh.vertices
+            #     faces = mesh.faces
+            #     # if obj == "milk":
+            #     #     break
+            #     for idx, pose in enumerate(poses):
+            #         if idx == 1:
+            #             print(f"added {obj} to frame {idx}")
+            #             translation = pose[1]
+            #             translation = np.array(translation)
+            #             quarternion = pose[0]
+            #             quarternion = np.array(quarternion)
+            #             server.scene.add_mesh_simple(
+            #                 name=f"/name/{obj}_{idx}",
+            #                 vertices=vertices,
+            #                 faces=faces,
+            #                 wxyz=quarternion,
+            #                 position=translation,
+            #             )
 
 
         time.sleep(1e-3)
